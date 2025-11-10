@@ -18,6 +18,15 @@ class LLMService:
         """Initialize the LLM service."""
         kernel = sk_manager.get_kernel()
         self._chat_service = sk_manager.chat_service
+        
+        if not self._chat_service:
+            logger.error("Chat service is not available. Check Azure OpenAI configuration.")
+            raise RuntimeError(
+                "Azure OpenAI chat service is not configured. "
+                "Please set AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, "
+                "and AZURE_OPENAI_DEPLOYMENT_NAME environment variables."
+            )
+        
         logger.info("LLM service initialized")
 
     async def generate_response(

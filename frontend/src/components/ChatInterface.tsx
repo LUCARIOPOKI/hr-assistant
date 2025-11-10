@@ -1,7 +1,7 @@
-import { useState, useRef, useEffect } from 'react';
-import { Send, Loader2 } from 'lucide-react';
-import { ChatMessage } from './ChatMessage';
-import { api } from '../services/api';
+import { useState, useRef, useEffect } from "react";
+import { Send, Loader2 } from "lucide-react";
+import { ChatMessage } from "./ChatMessage";
+import { api } from "../services/api";
 
 interface Message {
   id: string;
@@ -16,13 +16,13 @@ interface ChatInterfaceProps {
 
 export function ChatInterface({ isVisible }: ChatInterfaceProps) {
   const [messages, setMessages] = useState<Message[]>([]);
-  const [input, setInput] = useState('');
+  const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [sessionId] = useState(() => `session_${Date.now()}`);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   };
 
   useEffect(() => {
@@ -41,16 +41,22 @@ export function ChatInterface({ isVisible }: ChatInterfaceProps) {
     };
 
     setMessages((prev) => [...prev, userMessage]);
-    setInput('');
+    setInput("");
     setIsLoading(true);
 
     try {
-      const { query_id } = await api.query({
+      const response = await api.query({
         query: userMessage.content,
         session_id: sessionId,
-        user_id: 'default_user',
+        user_id: "default_user",
         top_k: 5,
       });
+
+      const query_id = response.metadata?.query_id as string;
+
+      if (!query_id) {
+        throw new Error("No query_id received from server");
+      }
 
       let attempts = 0;
       const maxAttempts = 60;
@@ -60,7 +66,7 @@ export function ChatInterface({ isVisible }: ChatInterfaceProps) {
         try {
           const status = await api.getStatus(query_id);
 
-          if (status.status === 'completed' && status.answer) {
+          if (status.status === "completed" && status.answer) {
             const assistantMessage: Message = {
               id: `assistant_${Date.now()}`,
               content: status.answer,
@@ -73,28 +79,31 @@ export function ChatInterface({ isVisible }: ChatInterfaceProps) {
             return;
           }
 
-          if (status.status === 'error') {
-            throw new Error(status.error || 'An error occurred processing your query');
+          if (status.status === "error") {
+            throw new Error(
+              status.error || "An error occurred processing your query"
+            );
           }
 
           attempts++;
           if (attempts < maxAttempts) {
             setTimeout(pollStatus, pollInterval);
           } else {
-            throw new Error('Request timeout');
+            throw new Error("Request timeout");
           }
         } catch (error) {
-          console.error('Polling error:', error);
+          console.error("Polling error:", error);
           throw error;
         }
       };
 
       await pollStatus();
     } catch (error) {
-      console.error('Error:', error);
+      console.error("Error:", error);
       const errorMessage: Message = {
         id: `error_${Date.now()}`,
-        content: 'Sorry, I encountered an error processing your request. Please try again.',
+        content:
+          "Sorry, I encountered an error processing your request. Please try again.",
         isUser: false,
         timestamp: new Date(),
       };
@@ -106,9 +115,7 @@ export function ChatInterface({ isVisible }: ChatInterfaceProps) {
   return (
     <div
       className={`transition-all duration-700 ease-in-out ${
-        isVisible
-          ? 'w-full opacity-100'
-          : 'w-0 opacity-0 overflow-hidden'
+        isVisible ? "w-full opacity-100" : "w-0 opacity-0 overflow-hidden"
       }`}
     >
       <div className="flex flex-col h-screen bg-gradient-to-b from-[#3F4F44] to-[#2C3930]">
@@ -132,8 +139,12 @@ export function ChatInterface({ isVisible }: ChatInterfaceProps) {
           {messages.length === 0 && (
             <div className="flex items-center justify-center h-full">
               <div className="text-center animate-fadeIn">
-                <p className="text-lg text-[#DCD7C9] mb-4">Start a conversation!</p>
-                <p className="text-sm text-[#A27B5C]">Ask me anything about HR policies and procedures</p>
+                <p className="text-lg text-[#DCD7C9] mb-4">
+                  Start a conversation!
+                </p>
+                <p className="text-sm text-[#A27B5C]">
+                  Ask me anything about HR policies and procedures
+                </p>
               </div>
             </div>
           )}
