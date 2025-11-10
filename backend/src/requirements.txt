@@ -1,0 +1,31 @@
+# Core Dependencies
+semantic-kernel==1.37.1
+pinecone-client==5.0.1
+azure-identity==1.25.0
+openai==1.109.1
+
+# Azure OpenAI
+azure-core==1.36.0
+
+# Data Processing
+pypdf2==3.0.1
+python-docx==1.1.0
+
+# API & Web
+fastapi==0.121.1
+uvicorn[standard]==0.38.0
+pydantic==2.11.10
+pydantic-settings==2.11.0
+httpx==0.28.1
+python-multipart==0.0.9
+
+# Database
+pymongo==4.15.3
+
+# Utilities
+python-dotenv==1.2.1
+loguru==0.7.3
+
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.23.5
