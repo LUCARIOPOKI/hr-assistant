@@ -1,2 +1,12 @@
 .env
 capestone_prj/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Logs
+logs/
+*.log

@@ -4,6 +4,9 @@ from typing import List, Dict, Any, Optional
 from loguru import logger
 from ..database.pinecone_client import pinecone_client
 from ..services.embedding_service import embedding_service
+from ..config.settings import get_settings
+
+settings = get_settings()
 
 
 class VectorStoreService:
@@ -90,6 +93,12 @@ class VectorStoreService:
         try:
             # Generate query embedding
             query_embedding = await embedding_service.generate_embedding(query)
+            
+            # Truncate embedding to match index dimension
+            target_dimension = settings.pinecone_dimension
+            if len(query_embedding) > target_dimension:
+                query_embedding = query_embedding[:target_dimension]
+                logger.debug(f"Truncated query embedding from {len(query_embedding)} to {target_dimension} dimensions")
 
             # Search Pinecone
             results = self._index.query(

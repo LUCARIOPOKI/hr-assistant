@@ -1,10 +1,10 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List, Dict, Any
 import uuid
+from pathlib import Path
 from ..api.schemas import (
     HealthResponse, QueryRequest, QueryResponse,
-    SummarizationRequest, SummarizationResponse,
 )
 from ..core.semantic_kernel_setup import sk_manager
 from ..config.settings import get_settings
@@ -13,9 +13,8 @@ from ..services.llm_service import llm_service
 from ..services.vector_store_service import vector_store_service
 from ..services.memory_service import memory_service
 from ..plugins.retrieval_plugin import RetrievalPlugin
-from ..plugins.summarization_plugin import SummarizationPlugin
-from ..plugins.company_plugin import CompanyPlugin
-from ..plugins.hr_policy_plugin import HRPolicyPlugin, EmployeeServicesPlugin, RecruitmentPlugin
+from ..database.mongodb_client import mongodb_client
+from ..database.pinecone_client import pinecone_client
 from loguru import logger
 
 router = APIRouter()
@@ -23,17 +22,108 @@ settings = get_settings()
 
 # Initialize plugins
 retrieval_plugin = RetrievalPlugin()
-summarization_plugin = SummarizationPlugin()
-company_plugin = CompanyPlugin()
-hr_policy_plugin = HRPolicyPlugin()
-employee_services_plugin = EmployeeServicesPlugin()
-recruitment_plugin = RecruitmentPlugin()
+
+# In-memory storage for query status tracking
+query_status_store: Dict[str, Dict[str, Any]] = {}
 
 
 @router.get("/health", response_model=HealthResponse)
 async def health():
-    """Health check endpoint."""
-    return HealthResponse(status="ok", version=settings.app_version, timestamp=datetime.utcnow())
+    """
+    Comprehensive health check endpoint.
+    
+    Checks:
+    - API status
+    - Azure OpenAI connection
+    - Pinecone connection
+    - MongoDB connection
+    - Semantic Kernel initialization
+    """
+    checks = {
+        "api": "ok",
+        "azure_openai": "unknown",
+        "pinecone": "unknown",
+        "mongodb": "unknown",
+        "semantic_kernel": "unknown"
+    }
+    
+    errors = []
+    
+    try:
+        # Check Azure OpenAI
+        if settings.azure_openai_api_key and settings.azure_openai_endpoint:
+            try:
+                await llm_service.initialize()
+                checks["azure_openai"] = "ok"
+            except Exception as e:
+                checks["azure_openai"] = "error"
+                errors.append(f"Azure OpenAI: {str(e)}")
+        else:
+            checks["azure_openai"] = "not_configured"
+            errors.append("Azure OpenAI: credentials not configured")
+        
+        # Check Pinecone
+        if settings.pinecone_api_key:
+            try:
+                index = pinecone_client.get_index()
+                if index:
+                    stats = index.describe_index_stats()
+                    checks["pinecone"] = "ok"
+                    checks["pinecone_vectors"] = stats.total_vector_count
+                else:
+                    checks["pinecone"] = "error"
+                    errors.append("Pinecone: index not available")
+            except Exception as e:
+                checks["pinecone"] = "error"
+                errors.append(f"Pinecone: {str(e)}")
+        else:
+            checks["pinecone"] = "not_configured"
+            errors.append("Pinecone: API key not configured")
+        
+        # Check MongoDB
+        try:
+            if mongodb_client._client:
+                mongodb_client._client.admin.command('ping')
+                checks["mongodb"] = "ok"
+                if mongodb_client._chunks_collection:
+                    checks["mongodb_chunks"] = mongodb_client._chunks_collection.count_documents({})
+            else:
+                checks["mongodb"] = "not_configured"
+        except Exception as e:
+            checks["mongodb"] = "error"
+            errors.append(f"MongoDB: {str(e)}")
+        
+        # Check Semantic Kernel
+        try:
+            kernel = sk_manager.get_kernel()
+            if kernel:
+                checks["semantic_kernel"] = "ok"
+            else:
+                checks["semantic_kernel"] = "error"
+                errors.append("Semantic Kernel: not initialized")
+        except Exception as e:
+            checks["semantic_kernel"] = "error"
+            errors.append(f"Semantic Kernel: {str(e)}")
+        
+        overall_status = "healthy" if not errors else "degraded"
+        
+        return HealthResponse(
+            status=overall_status,
+            version=settings.app_version,
+            timestamp=datetime.utcnow(),
+            checks=checks,
+            errors=errors if errors else None
+        )
+        
+    except Exception as e:
+        logger.error(f"Health check error: {e}")
+        return HealthResponse(
+            status="error",
+            version=settings.app_version,
+            timestamp=datetime.utcnow(),
+            checks=checks,
+            errors=[str(e)]
+        )
 
 
 @router.post("/query", response_model=QueryResponse)
@@ -42,29 +132,77 @@ async def query(req: QueryRequest):
     Process a user query using RAG (Retrieval Augmented Generation).
     
     This endpoint:
-    1. Retrieves relevant HR policy documents
-    2. Maintains conversation history
+    1. Creates a unique query ID for tracking
+    2. Retrieves relevant HR policy documents
     3. Generates contextual responses using LLM
+    4. Tracks all steps and status
+    
+    Returns query ID for status tracking via /status/{query_id}
     """
+    query_id = str(uuid.uuid4())
+    
+    # Initialize status tracking
+    query_status_store[query_id] = {
+        "query_id": query_id,
+        "status": "started",
+        "query": req.query,
+        "user_id": req.user_id,
+        "started_at": datetime.utcnow().isoformat(),
+        "steps": [],
+        "current_step": "initializing"
+    }
+    
+    def update_step(step_name: str, status: str = "in_progress", details: str = None):
+        """Helper to update step status"""
+        query_status_store[query_id]["current_step"] = step_name
+        query_status_store[query_id]["steps"].append({
+            "step": step_name,
+            "status": status,
+            "timestamp": datetime.utcnow().isoformat(),
+            "details": details
+        })
+    
     try:
-        # Initialize session if needed
+        # Step 1: Initialize session
+        update_step("session_initialization", "in_progress", "Creating or retrieving session")
         session_id = req.session_id or str(uuid.uuid4())
         memory_service.create_session(session_id, req.user_id)
-        
-        # Add user message to history
         memory_service.add_message(session_id, "user", req.query)
+        update_step("session_initialization", "completed", f"Session ID: {session_id}")
         
-        # Retrieve relevant documents
-        logger.info(f"Processing query: {req.query}")
+        # Step 2: Document retrieval
+        update_step("document_retrieval", "in_progress", f"Searching top {req.top_k} documents")
+        logger.info(f"[{query_id}] Processing query: {req.query}")
+        
+        search_results = await vector_store_service.search(
+            query=req.query,
+            top_k=req.top_k,
+            namespace="hr_policies"
+        )
+        
         retrieved_context = await retrieval_plugin.retrieve_and_answer(
             question=req.query,
             top_k=req.top_k
         )
         
-        # Get conversation history
+        # Store retrieved documents in status
+        retrieved_docs = []
+        for result in search_results:
+            retrieved_docs.append({
+                "filename": result.get("metadata", {}).get("filename", "Unknown"),
+                "title": result.get("metadata", {}).get("title", ""),
+                "score": result.get("score", 0),
+                "chunk_id": result.get("id", ""),
+                "text_preview": result.get("metadata", {}).get("text", "")[:200] + "..." if result.get("metadata", {}).get("text") else ""
+            })
+        
+        query_status_store[query_id]["retrieved_documents"] = retrieved_docs
+        update_step("document_retrieval", "completed", f"Retrieved {len(search_results)} relevant documents")
+        
+        # Step 3: Context building
+        update_step("context_building", "in_progress", "Building prompt with context and history")
         conversation_history = memory_service.get_formatted_history(session_id, limit=5)
         
-        # Build full prompt with context and history
         if conversation_history:
             full_prompt = CONVERSATION_CONTEXT_TEMPLATE.format(
                 history=conversation_history,
@@ -73,26 +211,24 @@ async def query(req: QueryRequest):
             )
         else:
             full_prompt = f"{HR_SYSTEM_PROMPT}\n\n{retrieved_context}"
+        update_step("context_building", "completed", "Prompt constructed successfully")
         
-        # Generate response
+        # Step 4: LLM generation
+        update_step("llm_generation", "in_progress", "Generating response using Azure OpenAI")
         await llm_service.initialize()
         answer = await llm_service.generate_response(
             prompt=full_prompt,
             temperature=0.7,
             max_tokens=1000
         )
+        update_step("llm_generation", "completed", f"Response generated ({len(answer)} chars)")
         
-        # Add assistant response to history
+        # Step 5: Finalization
+        update_step("finalization", "in_progress", "Saving response and preparing result")
         memory_service.add_message(session_id, "assistant", answer)
         
-        # Extract sources from retrieval
+        # Extract sources
         sources = []
-        search_results = await vector_store_service.search(
-            query=req.query,
-            top_k=req.top_k,
-            namespace="hr_policies"
-        )
-        
         for result in search_results:
             sources.append({
                 "filename": result.get("metadata", {}).get("filename", "Unknown"),
@@ -100,103 +236,107 @@ async def query(req: QueryRequest):
                 "title": result.get("metadata", {}).get("title", ""),
             })
         
+        # Update final status
+        query_status_store[query_id]["status"] = "completed"
+        query_status_store[query_id]["current_step"] = "completed"
+        query_status_store[query_id]["completed_at"] = datetime.utcnow().isoformat()
+        query_status_store[query_id]["answer"] = answer
+        query_status_store[query_id]["sources_count"] = len(sources)
+        update_step("finalization", "completed", "Query processing complete")
+        
+        logger.info(f"[{query_id}] Query completed successfully")
+        
         return QueryResponse(
             answer=answer,
             sources=sources,
-            conversation_id=0,  # Can be enhanced with DB storage
+            conversation_id=0,
             session_id=session_id,
-            metadata={"company_id": req.company_id, "top_k": req.top_k},
+            metadata={
+                "query_id": query_id,
+                "company_id": req.company_id,
+                "top_k": req.top_k,
+                "status_url": f"/api/v1/status/{query_id}"
+            },
         )
         
     except Exception as e:
-        logger.error(f"Error processing query: {e}")
+        logger.error(f"[{query_id}] Error processing query: {e}")
+        
+        # Update error status
+        query_status_store[query_id]["status"] = "error"
+        query_status_store[query_id]["error"] = str(e)
+        query_status_store[query_id]["failed_at"] = datetime.utcnow().isoformat()
+        update_step(query_status_store[query_id]["current_step"], "failed", str(e))
+        
         raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
 
 
-@router.post("/summarize", response_model=SummarizationResponse)
-async def summarize(req: SummarizationRequest):
+@router.get("/status/{query_id}")
+async def get_query_status(query_id: str):
     """
-    Generate a summary of HR documents for a specific audience.
+    Get detailed status and all processing steps for a query.
     
-    This can summarize policies, handbooks, or retrieved documents.
+    Returns:
+    - Current status (started, in_progress, completed, error)
+    - All processing steps with timestamps
+    - Current step being executed
+    - Final answer (if completed)
+    - Error details (if failed)
+    
+    Example response:
+    {
+        "query_id": "abc-123",
+        "status": "completed",
+        "query": "What is the vacation policy?",
+        "started_at": "2025-11-10T12:00:00",
+        "completed_at": "2025-11-10T12:00:05",
+        "current_step": "completed",
+        "steps": [
+            {
+                "step": "session_initialization",
+                "status": "completed",
+                "timestamp": "2025-11-10T12:00:00",
+                "details": "Session ID: xyz"
+            },
+            {
+                "step": "document_retrieval",
+                "status": "completed",
+                "timestamp": "2025-11-10T12:00:01",
+                "details": "Retrieved 5 relevant documents"
+            },
+            ...
+        ],
+        "answer": "According to the policy...",
+        "sources_count": 5
+    }
     """
-    try:
-        # In a real implementation, retrieve company documents
-        # For now, we'll use a sample document retrieval
-        logger.info(f"Generating {req.summary_type} summary for audience: {req.audience}")
-        
-        # Search for relevant documents
-        search_query = "HR policies procedures company handbook"
-        results = await vector_store_service.search(
-            query=search_query,
-            top_k=10,
-            namespace="hr_policies"
+    if query_id not in query_status_store:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Query ID '{query_id}' not found. It may have expired or never existed."
         )
-        
-        # Combine retrieved documents
-        if results:
-            document_text = "\n\n".join([r.get("text", "") for r in results[:5]])
-        else:
-            document_text = "No HR documents found in the system."
-        
-        # Generate summary
-        summary = await summarization_plugin.summarize_for_audience(
-            document=document_text,
-            audience=req.audience
-        )
-        
-        return SummarizationResponse(
-            company_name=f"Company {req.company_id}",
-            summary=summary,
-            summary_type=req.summary_type,
-            audience=req.audience,
-            generated_at=datetime.utcnow(),
-        )
-        
-    except Exception as e:
-        logger.error(f"Error generating summary: {e}")
-        raise HTTPException(status_code=500, detail=f"Error generating summary: {str(e)}")
+    
+    status_data = query_status_store[query_id]
+    
+    # Calculate duration if completed
+    if status_data.get("completed_at"):
+        started = datetime.fromisoformat(status_data["started_at"])
+        completed = datetime.fromisoformat(status_data["completed_at"])
+        status_data["duration_seconds"] = (completed - started).total_seconds()
+    
+    return status_data
 
 
-@router.get("/company/info")
-async def get_company_info(info_type: str = "overview"):
-    """Get company information."""
-    try:
-        info = await company_plugin.get_company_info(info_type=info_type)
-        return {"info_type": info_type, "content": info}
-    except Exception as e:
-        logger.error(f"Error getting company info: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/hr/policy")
-async def get_hr_policy(question: str):
-    """Ask HR policy questions."""
-    try:
-        answer = await hr_policy_plugin.answer_policy_question(question=question)
-        return {"question": question, "answer": answer}
-    except Exception as e:
-        logger.error(f"Error answering policy question: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/hr/leave-balance/{employee_id}")
-async def get_leave_balance(employee_id: str):
-    """Check employee leave balance."""
-    try:
-        balance = await employee_services_plugin.check_leave_balance(employee_id=employee_id)
-        return {"employee_id": employee_id, "balance": balance}
-    except Exception as e:
-        logger.error(f"Error checking leave balance: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/recruitment/openings")
-async def get_job_openings(department: str = "all"):
-    """Get current job openings."""
-    try:
-        openings = await recruitment_plugin.get_job_openings(department=department)
-        return {"department": department, "openings": openings}
-    except Exception as e:
-        logger.error(f"Error getting job openings: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+# Cleanup endpoint (optional, for maintenance)
+@router.delete("/status/{query_id}")
+async def clear_query_status(query_id: str):
+    """
+    Clear status data for a specific query.
+    
+    Useful for cleanup after retrieving results.
+    """
+    if query_id not in query_status_store:
+        raise HTTPException(status_code=404, detail=f"Query ID '{query_id}' not found")
+    
+    del query_status_store[query_id]
+    return {"message": f"Status data for query '{query_id}' cleared successfully"}

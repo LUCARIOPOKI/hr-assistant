@@ -132,6 +132,8 @@ class HealthResponse(BaseModel):
     status: str
     version: str
     timestamp: datetime
+    checks: Optional[Dict[str, Any]] = None
+    errors: Optional[List[str]] = None
 
 
 class ErrorResponse(BaseModel):

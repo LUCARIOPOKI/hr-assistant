@@ -43,16 +43,35 @@ class LLMService:
             await self.initialize()
 
         try:
-            # For SK v1.x, we'll use the chat service directly
-            # Construct messages if system prompt is provided
-            full_prompt = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
+            from semantic_kernel.contents import ChatHistory
+            from semantic_kernel.connectors.ai.open_ai import AzureChatPromptExecutionSettings
             
-            result = await self._chat_service.complete_async(
-                prompt=full_prompt,
-                settings=self._get_completion_settings(temperature, max_tokens),
+            # Create chat history
+            chat_history = ChatHistory()
+            
+            if system_prompt:
+                chat_history.add_system_message(system_prompt)
+            
+            chat_history.add_user_message(prompt)
+            
+            # Create settings
+            settings = AzureChatPromptExecutionSettings(
+                temperature=temperature,
+                max_tokens=max_tokens,
             )
             
-            return str(result)
+            # Get completion using get_chat_message_contents
+            response = await self._chat_service.get_chat_message_contents(
+                chat_history=chat_history,
+                settings=settings,
+            )
+            
+            # Extract text from response
+            if response and len(response) > 0:
+                return str(response[0].content)
+            else:
+                return ""
+            
         except Exception as e:
             logger.error(f"Error generating response: {e}")
             raise
@@ -78,39 +97,43 @@ class LLMService:
             await self.initialize()
 
         try:
-            # Convert messages to a prompt format
-            prompt = self._format_chat_messages(messages)
-            result = await self._chat_service.complete_async(
-                prompt=prompt,
-                settings=self._get_completion_settings(temperature, max_tokens),
-            )
-            return str(result)
-        except Exception as e:
-            logger.error(f"Error generating chat response: {e}")
-            raise
-
-    def _format_chat_messages(self, messages: List[Dict[str, str]]) -> str:
-        """Format chat messages into a single prompt."""
-        formatted = []
-        for msg in messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            formatted.append(f"{role.upper()}: {content}")
-        return "\n\n".join(formatted)
-
-    def _get_completion_settings(self, temperature: float, max_tokens: int) -> Any:
-        """Create completion settings object."""
-        # This is a simplified version; adjust based on SK version
-        try:
-            from semantic_kernel.connectors.ai.open_ai import OpenAIChatPromptExecutionSettings
-            return OpenAIChatPromptExecutionSettings(
+            from semantic_kernel.contents import ChatHistory
+            from semantic_kernel.connectors.ai.open_ai import AzureChatPromptExecutionSettings
+            
+            # Create chat history from messages
+            chat_history = ChatHistory()
+            
+            for msg in messages:
+                role = msg.get("role", "user").lower()
+                content = msg.get("content", "")
+                
+                if role == "system":
+                    chat_history.add_system_message(content)
+                elif role == "assistant":
+                    chat_history.add_assistant_message(content)
+                else:
+                    chat_history.add_user_message(content)
+            
+            # Create settings
+            settings = AzureChatPromptExecutionSettings(
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
-        except ImportError:
-            # Fallback for different SK versions
-            return None
-
+            
+            # Get completion
+            response = await self._chat_service.get_chat_message_contents(
+                chat_history=chat_history,
+                settings=settings,
+            )
+            
+            if response and len(response) > 0:
+                return str(response[0].content)
+            else:
+                return ""
+                
+        except Exception as e:
+            logger.error(f"Error generating chat response: {e}")
+            raise
 
 # Global instance
 llm_service = LLMService()
