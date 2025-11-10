@@ -110,12 +110,16 @@ class ConversationResponse(BaseModel):
 
 
 class QueryResponse(BaseModel):
-    """Schema for query response."""
+    """Schema for query response with agentic RAG metadata."""
     answer: str
     sources: List[Dict[str, Any]] = []
     conversation_id: int
     session_id: str
     metadata: Optional[Dict[str, Any]] = None
+    # Agentic RAG fields
+    agent_plan: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = []
+    iterations: Optional[int] = 0
 
 
 class SummarizationResponse(BaseModel):

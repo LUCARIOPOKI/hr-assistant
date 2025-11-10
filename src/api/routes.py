@@ -129,19 +129,19 @@ async def health():
 @router.post("/query", response_model=QueryResponse)
 async def query(req: QueryRequest):
     """
-    Process a user query using RAG (Retrieval Augmented Generation).
+    Process a user query using Agentic RAG.
     
-    This endpoint:
-    1. Creates a unique query ID for tracking
-    2. Retrieves relevant HR policy documents
-    3. Generates contextual responses using LLM
-    4. Tracks all steps and status
+    The agent autonomously:
+    1. Plans how to answer the question
+    2. Calls appropriate tools (search, retrieve details, etc.)
+    3. Reasons about the information
+    4. Generates a comprehensive answer
     
     Returns query ID for status tracking via /status/{query_id}
     """
     query_id = str(uuid.uuid4())
     
-    # Initialize status tracking
+    # Initialize status tracking with agent-specific fields
     query_status_store[query_id] = {
         "query_id": query_id,
         "status": "started",
@@ -149,7 +149,10 @@ async def query(req: QueryRequest):
         "user_id": req.user_id,
         "started_at": datetime.utcnow().isoformat(),
         "steps": [],
-        "current_step": "initializing"
+        "current_step": "initializing",
+        "agent_plan": None,
+        "tool_calls": [],
+        "iterations": 0
     }
     
     def update_step(step_name: str, status: str = "in_progress", details: str = None):
@@ -170,71 +173,94 @@ async def query(req: QueryRequest):
         memory_service.add_message(session_id, "user", req.query)
         update_step("session_initialization", "completed", f"Session ID: {session_id}")
         
-        # Step 2: Document retrieval
-        update_step("document_retrieval", "in_progress", f"Searching top {req.top_k} documents")
-        logger.info(f"[{query_id}] Processing query: {req.query}")
+        # Step 2: Agent Planning & Execution
+        update_step("agent_planning", "in_progress", "Agent analyzing query and planning approach")
+        logger.info(f"[{query_id}] Starting agentic execution for: {req.query}")
         
+        # Build agent system prompt with context
+        conversation_history = memory_service.get_formatted_history(session_id, limit=5)
+        
+        agent_system_prompt = f"""{HR_SYSTEM_PROMPT}
+
+You are an intelligent HR assistant with access to multiple tools to help answer questions.
+
+Available tools:
+- search_policy_documents: Search for specific policies by topic or keyword
+- get_document_details: Get complete information from a specific document
+- search_related_topics: Find connections between different policy areas
+- list_available_policies: See what policy documents are available
+
+Your task:
+1. Analyze the user's question carefully
+2. Plan which tools to use to gather comprehensive information
+3. Call the tools as needed to collect relevant data
+4. Synthesize the information into a clear, helpful answer
+5. Be thorough - use multiple tools if needed to provide complete answers
+
+Previous conversation:
+{conversation_history if conversation_history else "No previous context"}
+
+Remember: Base your answers only on the retrieved policy documents. If information is not available, say so clearly.
+"""
+        
+        # Execute agent with auto tool calling
+        await llm_service.initialize()
+        agent_result = await llm_service.agent_execute(
+            query=req.query,
+            system_prompt=agent_system_prompt,
+            max_iterations=5,
+            temperature=0.7,
+            max_tokens=2000
+        )
+        
+        # Extract agent results
+        answer = agent_result["answer"]
+        tool_calls = agent_result["tool_calls"]
+        iterations = agent_result["iterations"]
+        agent_plan = agent_result["agent_plan"]
+        
+        # Store agent metadata
+        query_status_store[query_id]["agent_plan"] = agent_plan
+        query_status_store[query_id]["tool_calls"] = tool_calls
+        query_status_store[query_id]["iterations"] = iterations
+        
+        update_step("agent_planning", "completed", 
+                   f"Agent completed in {iterations} iteration(s) with {len(tool_calls)} tool call(s)")
+        
+        # Step 3: Extract sources from tool calls
+        update_step("source_extraction", "in_progress", "Extracting document sources from agent tools")
+        sources = []
+        
+        # If agent used search tools, extract sources from those results
+        # For now, do a quick search to get sources for metadata
         search_results = await vector_store_service.search(
             query=req.query,
             top_k=req.top_k,
             namespace="hr_policies"
         )
         
-        retrieved_context = await retrieval_plugin.retrieve_and_answer(
-            question=req.query,
-            top_k=req.top_k
-        )
-        
-        # Store retrieved documents in status
         retrieved_docs = []
         for result in search_results:
-            retrieved_docs.append({
+            doc_info = {
                 "filename": result.get("metadata", {}).get("filename", "Unknown"),
                 "title": result.get("metadata", {}).get("title", ""),
                 "score": result.get("score", 0),
                 "chunk_id": result.get("id", ""),
                 "text_preview": result.get("metadata", {}).get("text", "")[:200] + "..." if result.get("metadata", {}).get("text") else ""
+            }
+            retrieved_docs.append(doc_info)
+            sources.append({
+                "filename": doc_info["filename"],
+                "score": doc_info["score"],
+                "title": doc_info["title"]
             })
         
         query_status_store[query_id]["retrieved_documents"] = retrieved_docs
-        update_step("document_retrieval", "completed", f"Retrieved {len(search_results)} relevant documents")
+        update_step("source_extraction", "completed", f"Extracted {len(sources)} source documents")
         
-        # Step 3: Context building
-        update_step("context_building", "in_progress", "Building prompt with context and history")
-        conversation_history = memory_service.get_formatted_history(session_id, limit=5)
-        
-        if conversation_history:
-            full_prompt = CONVERSATION_CONTEXT_TEMPLATE.format(
-                history=conversation_history,
-                question=req.query,
-                context=retrieved_context
-            )
-        else:
-            full_prompt = f"{HR_SYSTEM_PROMPT}\n\n{retrieved_context}"
-        update_step("context_building", "completed", "Prompt constructed successfully")
-        
-        # Step 4: LLM generation
-        update_step("llm_generation", "in_progress", "Generating response using Azure OpenAI")
-        await llm_service.initialize()
-        answer = await llm_service.generate_response(
-            prompt=full_prompt,
-            temperature=0.7,
-            max_tokens=1000
-        )
-        update_step("llm_generation", "completed", f"Response generated ({len(answer)} chars)")
-        
-        # Step 5: Finalization
+        # Step 4: Finalization
         update_step("finalization", "in_progress", "Saving response and preparing result")
         memory_service.add_message(session_id, "assistant", answer)
-        
-        # Extract sources
-        sources = []
-        for result in search_results:
-            sources.append({
-                "filename": result.get("metadata", {}).get("filename", "Unknown"),
-                "score": result.get("score", 0),
-                "title": result.get("metadata", {}).get("title", ""),
-            })
         
         # Update final status
         query_status_store[query_id]["status"] = "completed"
@@ -244,18 +270,22 @@ async def query(req: QueryRequest):
         query_status_store[query_id]["sources_count"] = len(sources)
         update_step("finalization", "completed", "Query processing complete")
         
-        logger.info(f"[{query_id}] Query completed successfully")
+        logger.info(f"[{query_id}] Agentic query completed successfully")
         
         return QueryResponse(
             answer=answer,
             sources=sources,
             conversation_id=0,
             session_id=session_id,
+            agent_plan=agent_plan,
+            tool_calls=tool_calls,
+            iterations=iterations,
             metadata={
                 "query_id": query_id,
                 "company_id": req.company_id,
                 "top_k": req.top_k,
-                "status_url": f"/api/v1/status/{query_id}"
+                "status_url": f"/api/v1/status/{query_id}",
+                "mode": "agentic_rag"
             },
         )
         
@@ -274,11 +304,15 @@ async def query(req: QueryRequest):
 @router.get("/status/{query_id}")
 async def get_query_status(query_id: str):
     """
-    Get detailed status and all processing steps for a query.
+    Get detailed status and all processing steps for an agentic query.
     
     Returns:
     - Current status (started, in_progress, completed, error)
     - All processing steps with timestamps
+    - Agent planning information
+    - Tool calls made by the agent
+    - Iterations taken
+    - Retrieved documents with scores
     - Current step being executed
     - Final answer (if completed)
     - Error details (if failed)
@@ -291,6 +325,20 @@ async def get_query_status(query_id: str):
         "started_at": "2025-11-10T12:00:00",
         "completed_at": "2025-11-10T12:00:05",
         "current_step": "completed",
+        "agent_plan": "Completed in 3 iteration(s) with 2 tool call(s)",
+        "iterations": 3,
+        "tool_calls": [
+            {
+                "tool_name": "search_policy_documents",
+                "arguments": {"query": "vacation policy", "top_k": 3},
+                "iteration": 1
+            },
+            {
+                "tool_name": "get_document_details",
+                "arguments": {"document_identifier": "HR Policy Manual"},
+                "iteration": 2
+            }
+        ],
         "steps": [
             {
                 "step": "session_initialization",
@@ -299,15 +347,25 @@ async def get_query_status(query_id: str):
                 "details": "Session ID: xyz"
             },
             {
-                "step": "document_retrieval",
+                "step": "agent_planning",
                 "status": "completed",
-                "timestamp": "2025-11-10T12:00:01",
-                "details": "Retrieved 5 relevant documents"
+                "timestamp": "2025-11-10T12:00:03",
+                "details": "Agent completed in 3 iteration(s) with 2 tool call(s)"
             },
             ...
         ],
+        "retrieved_documents": [
+            {
+                "filename": "HR Policy Manual 2023.pdf",
+                "title": "Vacation Policy",
+                "score": 0.95,
+                "chunk_id": "doc_123_chunk_5",
+                "text_preview": "Employees are entitled to..."
+            }
+        ],
         "answer": "According to the policy...",
-        "sources_count": 5
+        "sources_count": 5,
+        "duration_seconds": 5.2
     }
     """
     if query_id not in query_status_store:
