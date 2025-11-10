@@ -1,5 +1,6 @@
 .env
 capestone_prj/
+.github
 
 # Python cache
 __pycache__/
@@ -10,6 +11,3 @@ __pycache__/
 # Logs
 logs/
 *.log
-
-.github
-
