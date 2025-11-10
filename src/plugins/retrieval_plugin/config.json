@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "description": "Retrieval plugin for RAG-based document search",
+  "execution_settings": {
+    "default": {
+      "max_tokens": 2000,
+      "temperature": 0.3
+    }
+  }
+}

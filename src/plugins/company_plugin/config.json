@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "description": "Company-specific information plugin",
+  "execution_settings": {
+    "default": {
+      "max_tokens": 1000,
+      "temperature": 0.2
+    }
+  }
+}

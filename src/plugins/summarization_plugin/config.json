@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "description": "Summarization plugin for generating document summaries",
+  "execution_settings": {
+    "default": {
+      "max_tokens": 1500,
+      "temperature": 0.3
+    }
+  }
+}
